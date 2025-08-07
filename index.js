@@ -1,21 +1,8 @@
 const express = require('express');
 const cors = require('cors');
-const OpenAI = require('openai');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-
-// Initialize OpenAI
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY
-});
-
-// Initialize Anthropic (Claude)
-const anthropic = process.env.ANTHROPIC_API_KEY ? {
-  apiKey: process.env.ANTHROPIC_API_KEY,
-  baseURL: 'https://api.anthropic.com',
-  apiVersion: '2023-06-01'
-} : null;
 
 app.use(cors({
   origin: [
@@ -26,247 +13,203 @@ app.use(cors({
   ]
 }));
 
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 
 // Health check
 app.get('/', (req, res) => {
-  res.json({ status: 'ProcessArchitec Backend Running' });
+  res.json({ status: 'ProcessArchitec Backend Running', ai: !!process.env.ANTHROPIC_API_KEY });
 });
-
-// Claude API call function
-async function callClaude(prompt) {
-  const response = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': process.env.ANTHROPIC_API_KEY,
-      'anthropic-version': '2023-06-01'
-    },
-    body: JSON.stringify({
-      model: 'claude-3-opus-20240229',
-      max_tokens: 4000,
-      messages: [
-        {
-          role: 'user',
-          content: prompt
-        }
-      ],
-      system: `You are an expert n8n workflow automation specialist. You MUST return ONLY valid JSON that can be imported directly into n8n. 
-      No explanations, no markdown, no text before or after - ONLY the JSON object.
-      The JSON must include: name, nodes (array), connections (object), and settings (object).
-      Every node must have: id, name, type, position, and parameters.`
-    })
-  });
-
-  if (!response.ok) {
-    throw new Error(`Claude API error: ${response.status}`);
-  }
-
-  const data = await response.json();
-  return data.content[0].text;
-}
 
 // Main workflow generation endpoint
 app.post('/api/generate-workflow', async (req, res) => {
   try {
     const { businessContext, workflowDescription } = req.body;
     
-    // Create a detailed prompt
-    const prompt = `Create a production-ready n8n workflow JSON for this requirement:
+    console.log('Received request:', { 
+      hasContext: !!businessContext, 
+      description: workflowDescription?.substring(0, 100) 
+    });
 
-Business Context:
-- Business: ${businessContext.businessDescription || 'Not specified'}
-- Unique Value: ${businessContext.uniqueValue || 'Not specified'}
-- Revenue Model: ${businessContext.revenueModel || 'Not specified'}
-- Ideal Customer: ${businessContext.idealCustomer || 'Not specified'}
-- Current Tools: ${businessContext.disconnectedTools || 'Not specified'}
-- Pain Points: ${businessContext.wishAutomated || businessContext.painPoints || 'Not specified'}
-- Manual Tasks Time: ${businessContext.repetitiveTime || 'Not specified'}
-- Error Points: ${businessContext.errorPoints || 'Not specified'}
+    // Build comprehensive context
+    const contextSummary = `
+Business: ${businessContext?.businessDescription || 'Not specified'}
+Tools in use: ${businessContext?.disconnectedTools || businessContext?.currentTools || 'Not specified'}  
+Automation needs: ${businessContext?.wishAutomated || 'Not specified'}
+Pain points: ${businessContext?.errorPoints || 'Not specified'}
+    `.trim();
 
-Specific Workflow Requirement:
+    const prompt = `You are an n8n workflow expert. Create a sophisticated n8n workflow JSON.
+
+CONTEXT:
+${contextSummary}
+
+REQUIREMENT:
 ${workflowDescription}
 
-Create a complete n8n workflow that:
-1. Uses appropriate trigger nodes (webhook, schedule, or specific app triggers)
-2. Includes all necessary processing nodes
-3. Has proper error handling
-4. Includes relevant integrations based on the tools mentioned
-5. Is production-ready and can be imported directly into n8n
+Generate a complete n8n workflow with:
+1. Appropriate trigger (webhook, schedule, email, etc based on the requirement)
+2. All necessary processing nodes
+3. Real integrations mentioned in the requirement
+4. Proper error handling nodes
 
-Return ONLY the JSON object with this structure:
-{
-  "name": "workflow name",
-  "nodes": [...],
-  "connections": {...},
-  "settings": {...}
-}`;
+Return ONLY valid JSON that can be imported to n8n. The response must be a JSON object with:
+- name: descriptive workflow name
+- nodes: array of node objects (each with id, name, type, position, parameters)
+- connections: object defining how nodes connect
+- settings: object with executionOrder
+
+Make it sophisticated and production-ready, not a simple example.`;
 
     let workflow;
-    
-    // Try Claude first if available
+
+    // Use Claude if available
     if (process.env.ANTHROPIC_API_KEY) {
-      console.log('Using Claude for generation...');
-      try {
-        const claudeResponse = await callClaude(prompt);
-        // Clean the response (remove any markdown or extra text)
-        const jsonMatch = claudeResponse.match(/\{[\s\S]*\}/);
+      console.log('Using Claude...');
+      
+      const response = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': process.env.ANTHROPIC_API_KEY,
+          'anthropic-version': '2023-06-01'
+        },
+        body: JSON.stringify({
+          model: 'claude-3-sonnet-20240229', // Using Sonnet for faster response
+          max_tokens: 4000,
+          temperature: 0.7,
+          messages: [{
+            role: 'user',
+            content: prompt
+          }]
+        })
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        const text = data.content[0].text;
+        
+        // Extract JSON from response
+        const jsonMatch = text.match(/\{[\s\S]*\}/);
         if (jsonMatch) {
           workflow = JSON.parse(jsonMatch[0]);
-        } else {
-          workflow = JSON.parse(claudeResponse);
+          console.log('Claude generated workflow successfully');
         }
-      } catch (claudeError) {
-        console.error('Claude error, falling back to OpenAI:', claudeError.message);
-        // Fall back to OpenAI
-        const completion = await openai.chat.completions.create({
-          model: "gpt-4-turbo-preview",
-          messages: [
-            {
-              role: "system",
-              content: "You are an n8n workflow expert. Return only valid JSON, no explanations or markdown."
-            },
-            {
-              role: "user",
-              content: prompt
-            }
-          ],
-          temperature: 0.7,
-          max_tokens: 3000,
-          response_format: { type: "json_object" }
-        });
-        workflow = JSON.parse(completion.choices[0].message.content);
+      } else {
+        console.error('Claude API error:', response.status);
+        throw new Error('Claude API failed');
       }
-    } else {
-      // Use OpenAI if Claude not configured
-      console.log('Using OpenAI for generation...');
+    }
+
+    // If no workflow yet, use OpenAI
+    if (!workflow && process.env.OPENAI_API_KEY) {
+      console.log('Using OpenAI...');
+      const OpenAI = require('openai');
+      const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+      
       const completion = await openai.chat.completions.create({
         model: "gpt-4-turbo-preview",
         messages: [
-          {
-            role: "system",
-            content: "You are an n8n workflow expert. Return only valid JSON, no explanations or markdown."
-          },
-          {
-            role: "user",
-            content: prompt
-          }
+          { role: "system", content: "You are an n8n expert. Return only valid JSON." },
+          { role: "user", content: prompt }
         ],
         temperature: 0.7,
         max_tokens: 3000,
         response_format: { type: "json_object" }
       });
+      
       workflow = JSON.parse(completion.choices[0].message.content);
+      console.log('OpenAI generated workflow successfully');
     }
 
-    // Ensure workflow has required fields
+    // If still no workflow, create a better fallback
+    if (!workflow) {
+      console.log('Using intelligent fallback...');
+      
+      // Parse the description to create a more relevant workflow
+      const isEmailWorkflow = workflowDescription.toLowerCase().includes('email');
+      const isScheduled = workflowDescription.toLowerCase().includes('daily') || 
+                         workflowDescription.toLowerCase().includes('schedule');
+      const needsGoogleSheets = workflowDescription.toLowerCase().includes('sheet') || 
+                               workflowDescription.toLowerCase().includes('spreadsheet');
+      
+      workflow = {
+        name: `ProcessArchitec - ${workflowDescription.substring(0, 50)}`,
+        nodes: [
+          {
+            id: "trigger",
+            name: isEmailWorkflow ? "Email Trigger" : isScheduled ? "Schedule Trigger" : "Webhook",
+            type: isEmailWorkflow ? "n8n-nodes-base.emailReadImap" : 
+                  isScheduled ? "n8n-nodes-base.scheduleTrigger" : 
+                  "n8n-nodes-base.webhook",
+            position: [250, 300],
+            parameters: isEmailWorkflow ? {
+              mailbox: "INBOX",
+              postProcessAction: "nothing",
+              options: {}
+            } : isScheduled ? {
+              rule: { interval: [{ field: "hours", hoursInterval: 24 }] }
+            } : {
+              path: "workflow-trigger",
+              method: "POST"
+            }
+          },
+          {
+            id: "process",
+            name: "Process Data",
+            type: "n8n-nodes-base.code",
+            position: [500, 300],
+            parameters: {
+              jsCode: `// Process the incoming data\nconst items = $input.all();\nreturn items.map(item => ({\n  json: {\n    ...item.json,\n    processed: true,\n    timestamp: new Date().toISOString()\n  }\n}));`
+            }
+          }
+        ],
+        connections: {
+          "trigger": {
+            main: [[{ node: "process", type: "main", index: 0 }]]
+          }
+        },
+        settings: { executionOrder: "v1" }
+      };
+
+      // Add Google Sheets if mentioned
+      if (needsGoogleSheets) {
+        workflow.nodes.push({
+          id: "sheets",
+          name: "Google Sheets",
+          type: "n8n-nodes-base.googleSheets",
+          position: [750, 300],
+          parameters: {
+            operation: "append",
+            sheetId: "your-sheet-id",
+            range: "A:Z"
+          }
+        });
+        workflow.connections["process"] = {
+          main: [[{ node: "sheets", type: "main", index: 0 }]]
+        };
+      }
+    }
+
+    // Ensure valid structure
     workflow.name = workflow.name || `ProcessArchitec Workflow - ${Date.now()}`;
-    workflow.nodes = workflow.nodes || [];
-    workflow.connections = workflow.connections || {};
     workflow.settings = workflow.settings || { executionOrder: "v1" };
     
-    // Add position to nodes if missing
-    workflow.nodes = workflow.nodes.map((node, index) => ({
-      ...node,
-      position: node.position || [250 + (index * 250), 300]
-    }));
-
-    console.log('Successfully generated workflow');
     res.json(workflow);
     
   } catch (error) {
-    console.error('Error generating workflow:', error);
-    
-    // Return a comprehensive fallback workflow
-    const fallbackWorkflow = {
-      name: `ProcessArchitec Workflow - ${Date.now()}`,
-      nodes: [
-        {
-          id: "webhook_trigger",
-          name: "Webhook Trigger",
-          type: "n8n-nodes-base.webhook",
-          position: [250, 300],
-          parameters: {
-            path: "process-trigger",
-            method: "POST",
-            responseMode: "onReceived",
-            responseData: "allEntries"
-          }
-        },
-        {
-          id: "set_data",
-          name: "Set Data",
-          type: "n8n-nodes-base.set",
-          position: [500, 300],
-          parameters: {
-            values: {
-              string: [
-                {
-                  name: "status",
-                  value: "processing"
-                },
-                {
-                  name: "timestamp",
-                  value: "={{$now}}"
-                }
-              ]
-            }
-          }
-        },
-        {
-          id: "http_request",
-          name: "Process Data",
-          type: "n8n-nodes-base.httpRequest",
-          position: [750, 300],
-          parameters: {
-            url: "https://api.example.com/process",
-            method: "POST",
-            sendBody: true,
-            bodyParameters: {
-              parameters: [
-                {
-                  name: "data",
-                  value: "={{$json}}"
-                }
-              ]
-            }
-          }
-        },
-        {
-          id: "respond",
-          name: "Respond to Webhook",
-          type: "n8n-nodes-base.respondToWebhook",
-          position: [1000, 300],
-          parameters: {
-            respondWith: "json",
-            responseBody: '{"success": true, "message": "Workflow completed successfully"}'
-          }
-        }
-      ],
-      connections: {
-        "webhook_trigger": {
-          main: [[{ node: "set_data", type: "main", index: 0 }]]
-        },
-        "set_data": {
-          main: [[{ node: "http_request", type: "main", index: 0 }]]
-        },
-        "http_request": {
-          main: [[{ node: "respond", type: "main", index: 0 }]]
-        }
-      },
-      settings: {
-        executionOrder: "v1"
-      }
-    };
-    
-    res.json(fallbackWorkflow);
+    console.error('Generation error:', error);
+    res.status(500).json({ 
+      error: 'Generation failed', 
+      details: error.message,
+      hasAI: !!process.env.ANTHROPIC_API_KEY || !!process.env.OPENAI_API_KEY
+    });
   }
 });
 
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
-  console.log('AI Providers configured:', {
-    openai: !!process.env.OPENAI_API_KEY,
-    anthropic: !!process.env.ANTHROPIC_API_KEY
+  console.log('AI configured:', {
+    claude: !!process.env.ANTHROPIC_API_KEY,
+    openai: !!process.env.OPENAI_API_KEY
   });
 });
